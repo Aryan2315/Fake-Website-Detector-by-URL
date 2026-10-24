@@ -1,40 +1,42 @@
-import java.time.LocalDateTime;
+import java.util.List;
 
+/** One saved scan (a row in scan_history.tsv) plus helpers to save, load and count. */
 public class ScanHistory {
-    private int id;
-    private String userEmail;
-    private String url;
-    private String status;
-    private int riskScore;
-    private String scanTime;
 
-    public ScanHistory(String userEmail, String url, String status, int riskScore) {
-        this.userEmail = userEmail;
+    public final String email;
+    public final String time;
+    public final String url;
+    public final int score;
+    public final String verdict;
+
+    public ScanHistory(String email, String time, String url, int score, String verdict) {
+        this.email = email;
+        this.time = time;
         this.url = url;
-        this.status = status;
-        this.riskScore = riskScore;
-        this.scanTime = LocalDateTime.now().toString();
+        this.score = score;
+        this.verdict = verdict;
     }
 
-    public ScanHistory(int id, String userEmail, String url, String status, int riskScore, String scanTime) {
-        this.id = id;
-        this.userEmail = userEmail;
-        this.url = url;
-        this.status = status;
-        this.riskScore = riskScore;
-        this.scanTime = scanTime;
+    public static void add(String email, PhisingDetector.ScanResult r) {
+        DataBaseConnection.addHistory(new ScanHistory(email, r.time, r.url, r.score, r.verdict));
     }
 
-    public int getId() { return id; }
-    public String getUserEmail() { return userEmail; }
-    public String getUrl() { return url; }
-    public String getStatus() { return status; }
-    public int getRiskScore() { return riskScore; }
-    public String getScanTime() { return scanTime; }
+    public static List<ScanHistory> forUser(String email) {
+        return DataBaseConnection.loadHistory(email);
+    }
 
-    @Override
-    public String toString() {
-        return String.format("[%s] URL: %s | Status: %s (Risk: %d%%) | Time: %s", 
-                userEmail, url, status, riskScore, scanTime);
+    public static void clear(String email) {
+        DataBaseConnection.clearHistory(email);
+    }
+
+    /** Returns {safe, suspicious, phishing}. */
+    public static int[] counts(List<ScanHistory> list) {
+        int[] c = new int[3];
+        for (ScanHistory h : list) {
+            if (h.verdict.equals("SAFE")) c[0]++;
+            else if (h.verdict.equals("SUSPICIOUS")) c[1]++;
+            else c[2]++;
+        }
+        return c;
     }
 }
