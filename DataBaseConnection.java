@@ -1,89 +1,145 @@
-import java.sql.*;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Pure-Java storage (no drivers needed).
+ *   users.txt         ->  email|name|salt|sha256(salt+password)
+ *   scan_history.tsv  ->  email \t time \t score \t verdict \t url
+ */
 public class DataBaseConnection {
-    private static final String DB_URL = "jdbc:sqlite:phishing_detector.db";
 
-    static {
-        initializeDatabase();
+    private static final Path USERS = Paths.get("users.txt");
+    private static final Path HISTORY = Paths.get("scan_history.tsv");
+    private static final Object LOCK = new Object();
+
+    // ------------------------------------------------------------------ users
+
+    public static boolean userExists(String email) {
+        return findUser(email) != null;
     }
 
-    public static Connection connect() {
-        try {
-            Class.forName("org.sqlite.JDBC");
-            return DriverManager.getConnection(DB_URL);
-        } catch (Exception e) {
+    public static boolean registerUser(String name, String email, String password) {
+        synchronized (LOCK) {
+            email = email.trim().toLowerCase();
+            if (findUser(email) != null) return false;
+            String salt = randomSalt();
+            String line = email + "|" + name.replace("|", " ").trim() + "|" + salt + "|" + hash(salt, password);
             try {
-                return DriverManager.getConnection(DB_URL);
-            } catch (SQLException ex) {
-                System.err.println("Database connection error: " + ex.getMessage());
-                return null;
+                Files.write(USERS, (line + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                return true;
+            } catch (IOException e) {
+                e.printStackTrace();
+                return false;
             }
         }
     }
 
-    public static void initializeDatabase() {
-        String sql = "CREATE TABLE IF NOT EXISTS scan_history (\n"
-                 + " id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
-                 + " user_email TEXT NOT NULL,\n"
-                 + " url TEXT NOT NULL,\n"
-                 + " status TEXT NOT NULL,\n"
-                 + " risk_score INTEGER NOT NULL,\n"
-                 + " scan_time TEXT NOT NULL\n"
-                 + ");";
-
-        try (Connection conn = connect();
-             Statement stmt = conn != null ? conn.createStatement() : null) {
-            if (stmt != null) {
-                stmt.execute(sql);
-            }
-        } catch (SQLException e) {
-            System.err.println("Error initializing database table: " + e.getMessage());
-        }
+    /** Returns the user's name when the login is correct, otherwise null. */
+    public static String login(String email, String password) {
+        String[] u = findUser(email);
+        if (u == null) return null;
+        boolean ok = MessageDigest.isEqual(
+                hash(u[2], password).getBytes(StandardCharsets.UTF_8),
+                u[3].getBytes(StandardCharsets.UTF_8));
+        return ok ? u[1] : null;
     }
 
-    public static void saveScan(ScanHistory history) {
-        String sql = "INSERT INTO scan_history(user_email, url, status, risk_score, scan_time) VALUES(?, ?, ?, ?, ?)";
-
-        try (Connection conn = connect();
-             PreparedStatement pstmt = conn != null ? conn.prepareStatement(sql) : null) {
-            if (pstmt != null) {
-                pstmt.setString(1, history.getUserEmail());
-                pstmt.setString(2, history.getUrl());
-                pstmt.setString(3, history.getStatus());
-                pstmt.setInt(4, history.getRiskScore());
-                pstmt.setString(5, history.getScanTime());
-                pstmt.executeUpdate();
-            }
-        } catch (SQLException e) {
-            System.err.println("Error saving scan record: " + e.getMessage());
-        }
+    public static String getName(String email) {
+        String[] u = findUser(email);
+        return u == null ? "" : u[1];
     }
 
-    public static List<ScanHistory> getHistoryForUser(String email) {
-        List<ScanHistory> historyList = new ArrayList<>();
-        String sql = "SELECT id, user_email, url, status, risk_score, scan_time FROM scan_history WHERE user_email = ? ORDER BY id DESC";
-
-        try (Connection conn = connect();
-             PreparedStatement pstmt = conn != null ? conn.prepareStatement(sql) : null) {
-            if (pstmt != null) {
-                pstmt.setString(1, email);
-                ResultSet rs = pstmt.executeQuery();
-                while (rs.next()) {
-                    historyList.add(new ScanHistory(
-                        rs.getInt("id"),
-                        rs.getString("user_email"),
-                        rs.getString("url"),
-                        rs.getString("status"),
-                        rs.getInt("risk_score"),
-                        rs.getString("scan_time")
-                    ));
+    private static String[] findUser(String email) {
+        synchronized (LOCK) {
+            if (!Files.exists(USERS)) return null;
+            email = email.trim().toLowerCase();
+            try {
+                for (String line : Files.readAllLines(USERS, StandardCharsets.UTF_8)) {
+                    String[] p = line.split("\\|", 4);
+                    if (p.length == 4 && p[0].equals(email)) return p;
                 }
+            } catch (IOException e) {
+                e.printStackTrace();
             }
-        } catch (SQLException e) {
-            System.err.println("Error fetching scan history: " + e.getMessage());
+            return null;
         }
-        return historyList;
+    }
+
+    private static String randomSalt() {
+        byte[] b = new byte[8];
+        new SecureRandom().nextBytes(b);
+        return toHex(b);
+    }
+
+    private static String hash(String salt, String password) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return toHex(md.digest((salt + password).getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) sb.append(String.format("%02x", b));
+        return sb.toString();
+    }
+
+    // ---------------------------------------------------------------- history
+
+    public static void addHistory(ScanHistory h) {
+        synchronized (LOCK) {
+            String line = h.email + "\t" + h.time + "\t" + h.score + "\t" + h.verdict + "\t"
+                    + h.url.replaceAll("[\\t\\r\\n]", " ");
+            try {
+                Files.write(HISTORY, (line + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public static List<ScanHistory> loadHistory(String email) {
+        synchronized (LOCK) {
+            List<ScanHistory> out = new ArrayList<>();
+            if (!Files.exists(HISTORY)) return out;
+            email = email.trim().toLowerCase();
+            try {
+                for (String line : Files.readAllLines(HISTORY, StandardCharsets.UTF_8)) {
+                    String[] p = line.split("\t", 5);
+                    if (p.length == 5 && p[0].equals(email)) {
+                        out.add(new ScanHistory(p[0], p[1], p[4], Integer.parseInt(p[2]), p[3]));
+                    }
+                }
+            } catch (IOException | NumberFormatException e) {
+                e.printStackTrace();
+            }
+            return out;
+        }
+    }
+
+    public static void clearHistory(String email) {
+        synchronized (LOCK) {
+            if (!Files.exists(HISTORY)) return;
+            email = email.trim().toLowerCase();
+            try {
+                List<String> keep = new ArrayList<>();
+                for (String line : Files.readAllLines(HISTORY, StandardCharsets.UTF_8)) {
+                    if (!line.startsWith(email + "\t")) keep.add(line);
+                }
+                Files.write(HISTORY, keep, StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
     }
 }
